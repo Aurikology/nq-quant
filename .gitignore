@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+data/market/
+data/config.json
+data/backtests/
+node_modules/
+.venv/

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "firm": "generic",
+  "accountSize": 50000,
+  "dailyLossLimit": 1000,
+  "maxDrawdown": 2000,
+  "drawdownType": "trailing_eod",
+  "consistencyRulePct": 50,
+  "minTradingDays": 5,
+  "payoutCadenceDays": 14,
+  "maxContracts": { "NQ": 5, "MNQ": 50 },
+  "maxRiskPerTradePct": 1.0,
+  "revengeWindowMin": 15,
+  "maxTradesPerSession": 2,
+  "allowedSessions": ["asia", "ny_am", "ny_pm"]
+}

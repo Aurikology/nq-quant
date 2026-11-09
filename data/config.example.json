@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "timezone": "America/Toronto",
+  "instrument": "NQ",
+  "sessions": {
+    "asia": {
+      "start": "20:00",
+      "end": "00:00",
+      "enabled": true
+    },
+    "ny_am": {
+      "start": "09:30",
+      "end": "11:00",
+      "killzoneStart": "08:30",
+      "enabled": true
+    },
+    "ny_pm": {
+      "start": "13:30",
+      "end": "16:00",
+      "enabled": true
+    }
+  },
+  "planDeadlineMin": 15
+}
