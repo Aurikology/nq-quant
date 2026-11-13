@@ -5,6 +5,7 @@
   sweep      parameter grid, chosen in-sample, reported out-of-sample; writes sweep-latest.json
   scan       the automated box for the next session, validated by core/plan.js; files nothing
   levels     FVGs, IFVGs, liquidity pools, the DOL and its LRLR/HRLR grade at the latest closed bar
+  journal    score an FX Replay trade export with the same statistics; writes journal-latest.json
   judas      Judas-swing replay: baseline vs the live rule set, one filter ablated at a time; writes judas-latest.json
 """
 
@@ -56,6 +57,22 @@ def _exec(a, m: Market) -> Market | None:
         sys.exit(f"no 1m bars at {path}; run `python -m quant fetch --interval 1m` or pass --exec same")
     em = Market(read_csv(path))
     return None if em.bar_secs >= m.bar_secs else em
+
+
+def cmd_journal(a):
+    from . import journal
+    path = Path(a.csv)
+    if not path.exists():
+        sys.exit(f"no export at {path}; FX Replay -> Testing -> Analytics -> download")
+    d = journal.load_fxreplay(path)
+    rep = journal.score(d, tuple(a.exclude_final))
+    rep["by_session"] = journal.sessions(d).reset_index().to_dict(orient="records")
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "journal-latest.json").write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
+    for k, v in rep.items():
+        if k != "by_session":
+            print(f"{k:22} {v}")
+    print(journal.sessions(d).to_string())
 
 
 def cmd_judas(a):
@@ -333,9 +350,14 @@ def main(argv=None):
     jd.add_argument("--csv", help="1m bars CSV; default the Yahoo 1m cache")
     jd.add_argument("--days", type=int, help="only the last N calendar days")
 
+    jn = sub.add_parser("journal")
+    jn.add_argument("--csv", default=str(DATA / "fxreplay" / "trades.csv"), help="FX Replay analytics export")
+    jn.add_argument("--exclude-final", type=float, nargs="*", default=[],
+                    help="final balances of sessions that ran a different strategy")
+
     a = ap.parse_args(argv)
     {"fetch": cmd_fetch, "backtest": cmd_backtest, "sweep": cmd_sweep, "scan": cmd_scan,
-     "levels": cmd_levels, "judas": cmd_judas}[a.cmd](a)
+     "levels": cmd_levels, "judas": cmd_judas, "journal": cmd_journal}[a.cmd](a)
 
 
 if __name__ == "__main__":
