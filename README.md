@@ -15,6 +15,8 @@ The pattern is a mechanical rule set for "inverted fair value gaps": three-bar p
 | Risk | `quant/risk.py` | Applies daily-loss, drawdown and position-size limits. Tested for parity with an independent JavaScript implementation (`core/risk.js`) via `quant/bridge.mjs` |
 | Statistics | `quant/metrics.py` | Net P&L, profit factor, daily Sharpe, max drawdown, a **bootstrap 95% CI** on mean R, and a **permutation test** against random entries |
 | Model selection | `python -m quant sweep` | Grid search, with parameters chosen **in-sample** and reported **out-of-sample** (70/30 split by date) |
+| Live-rule ablation | `python -m quant judas` | Replays a discretionary trader's written entry rules as five switchable filters, then turns each off in turn to measure what it does. CIs by trade and by **session block bootstrap** (trades in one session share a tape) |
+| Performance | `quant/liquidity.py` `RangeMax` | Equal-high/low clustering asks "did any bar between two pivots trade past this level?" thousands of times per call. A **sparse table** answers it in O(1) after an O(n log n) build, and pools are memoized across runs. Tested equal to the original scan on randomized series |
 
 ## Latest result (5m structure, 1m fills, 2026-09-15 to 2026-10-13)
 
@@ -30,6 +32,21 @@ The pattern is a mechanical rule set for "inverted fair value gaps": three-bar p
 
 **Reading it honestly:** the permutation test says the entry timing beats chance at the 5% level. The confidence interval still includes zero, though, and one large winner carries the result. Eleven trades is not enough evidence. The next step is a longer sample from exported multi-year data (`--csv`), not more parameter tuning.
 
+## Live-rule ablation (1m bars, 2026-09-14 to 2026-11-13)
+
+The Judas-swing replay (`quant/judas.py`) with the exit a trader uses live: half off at 2R, stop to entry, the rest under a stop trailed behind confirmed swings. "Live" adds the five entry filters a discretionary trader wrote down between 2026-10-27 and 2026-11-06: minimum 3-point stop, stop at least half the median range of the last 5 bars, market structure already pointing the trade's way, no open opposing gap of 10+ points before 2R, and cancel the order if 2R prints before the fill.
+
+| Run (59,385 bars) | Trades | Total R | Mean R | 95% CI, session bootstrap |
+|---|---|---|---|---|
+| No filters | 37 | −13.08 | −0.35 | [−0.89, +0.39] |
+| All live filters | 3 | −3.12 | −1.04 | too few trades |
+| Live, without cancel-before-fill | 11 | −2.25 | −0.20 | [−1.04, +0.68] |
+| Live, without any one of the other four | 3 | −3.12 | −1.04 | unchanged |
+
+**Reading it honestly:** written down as code, the live rules remove 92% of setups, and no version shows an edge. The cancel-before-fill rule is the only one that changes this sample; the other four overlap. The trader's discretionary paper results come from judgement this code does not capture, such as higher-timeframe gaps and target quality, and this table measures that gap rather than assuming it away. The target is a sample of **200+ trades** from multi-year exported 1m data (`--csv`) before any of these numbers mean much.
+
+Speed (same machine, identical output): two weeks of 1m bars went from 1.6 s to 0.3 s per replay with the sparse table, and the seven-run ablation from 25.3 s to 7.2 s with pool memoization. The full two-month ablation runs in about 2 minutes.
+
 ## Run it
 
 ```bash
@@ -37,7 +54,8 @@ pip install -r quant/requirements.txt
 python -m quant fetch --interval 5m      # and --interval 1m for fills
 python -m quant backtest                 # writes data/backtests/latest.json
 python -m quant sweep                    # in-sample pick, out-of-sample report
-python -m pytest quant/tests             # 52 tests; the parity tests need Node 24+
+python -m quant judas                    # live-rule ablation on 1m bars; writes judas-latest.json
+python -m pytest quant/tests             # 100 tests; the parity tests need Node 24+
 ```
 
 Pulled out of a larger private trading-journal project, where the same rule files drive a desktop app.

@@ -214,27 +214,54 @@ def _clusters(piv: np.ndarray, px: np.ndarray, eq_tol: float, high: bool) -> lis
     """
     sign = 1.0 if high else -1.0
     v = sign * px  # work on highs; lows are mirrored
+    rmq = RangeMax(v)
     clusters: list[list[int]] = []
-    alive: list[list[int]] = []
+    alive: list[list] = []  # [pivots, level (max), floor (min)], kept incrementally
     for j in piv:
         p, best, still = v[j], None, []
-        for cl in alive:
-            lvl, low = v[cl].max(), v[cl].min()
-            between = v[cl[-1] + 1:j]
-            peak = between.max() if between.size else -np.inf
+        for entry in alive:
+            cl, lvl, low = entry
+            peak = rmq.query(cl[-1] + 1, j)  # O(1) instead of a scan of the bars between
             fits = max(lvl, p) - min(low, p) <= eq_tol and peak <= max(lvl, p)
             if peak > lvl and not fits:
                 continue  # its level was traded through: no longer a pool
-            still.append(cl)
+            still.append(entry)
             if fits:
-                best = cl  # the most recent qualifying cluster
+                best = entry  # the most recent qualifying cluster
         alive = still
         if best is not None:
-            best.append(int(j))
+            best[0].append(int(j))
+            best[1], best[2] = max(best[1], p), min(best[2], p)
         else:
-            alive.append([int(j)])
-            clusters.append(alive[-1])
+            alive.append([[int(j)], p, p])
+            clusters.append(alive[-1][0])
     return [cl for cl in clusters if len(cl) >= 2]
+
+
+class RangeMax:
+    """Sparse table for range-maximum queries: O(n log n) build, O(1) query on [a, b).
+
+    Row k holds max(v[i : i + 2**k]); a query covers [a, b) with two overlapping power-of-two
+    blocks. Used by `_clusters`, which asks "did any bar between these two pivots trade beyond the
+    level?" once per live cluster per pivot.
+    """
+
+    def __init__(self, v: np.ndarray):
+        v = np.asarray(v, dtype=float)
+        self.rows = [v]
+        k = 1
+        while 2 * k <= len(v):
+            prev = self.rows[-1]
+            self.rows.append(np.maximum(prev[:-k], prev[k:]))
+            k *= 2
+
+    def query(self, a: int, b: int) -> float:
+        if b <= a:
+            return -np.inf
+        a, b = int(a), int(b)
+        k = (b - a).bit_length() - 1
+        row = self.rows[k]
+        return float(max(row[a], row[b - (1 << k)]))
 
 
 def recent_start(bars: pd.DataFrame, cut: int, lookback_sessions: int = 3) -> int:
