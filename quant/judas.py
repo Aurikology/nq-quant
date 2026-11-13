@@ -36,7 +36,7 @@ fill bar does not count, and a stop moved to entry is live from the next bar.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +72,29 @@ class Params:
     entry_mode: str = "ce"  # "ce" | "edge" (the box's near edge)
     htf: str = "agree"  # "agree" | "sweep" | "both" (see the module docstring); "daily": daily alone (research only)
     stop_slip: float = 0.0  # points added to every stop fill (2026-11-05 live fill slipped 7.6)
+    # Live entry filters, added to the paper rules 2026-10-27 to 2026-11-06. Off by default so the
+    # baseline replay is unchanged; `Params.live()` turns all of them on. Each can be ablated.
+    min_stop: float = 0.0  # skip a stop under this many points (live: 3)
+    stop_vs_range: float = 0.0  # skip when risk < k x median bar range of the last `range_bars` (live: 0.5)
+    range_bars: int = 5
+    structure_agree: bool = False  # the Structure state at the order must already point the trade's way
+    max_opposing_gap: float = float("inf")  # skip when an open opposing gap this big sits between entry and 2R (live: 10)
+    cancel_tp1_unfilled: bool = False  # cancel the order if price reaches 2R before it fills
+
+    @classmethod
+    def live(cls, **kw) -> "Params":
+        """The rule set the paper sessions trade today: direction from live structure (daily and
+        weekly are context, not a gate), all five entry filters, half at 2R plus a trailed runner
+        (model `p2r_trail`). The 3-point floor, 10-point gap and 0.5 x range are the live numbers;
+        `range_bars` = 5 is a default, not taken from the live rules."""
+        base = dict(htf="both", min_stop=3.0, stop_vs_range=0.5, structure_agree=True,
+                    max_opposing_gap=10.0, cancel_tp1_unfilled=True)
+        base.update(kw)
+        return cls(**base)
+
+
+LIVE_FILTERS = ("min_stop", "stop_vs_range", "structure_agree", "max_opposing_gap", "cancel_tp1_unfilled")
+LIVE_MODEL = "p2r_trail"
 
 
 @dataclass
@@ -164,6 +187,43 @@ def structure(b: pd.DataFrame, pivot: int = 2) -> np.ndarray:
     return state
 
 
+_POOL_CACHE: dict = {}
+
+
+def _pools(b: pd.DataFrame, cut: int) -> list:
+    """`find_pools(b, cut)`, memoized. Pools depend only on the bars before `cut`, and every run
+    (baseline, live, each ablation) asks for the same (window, cut) pairs, so they are computed once.
+    The key is the window's first and last-read bar plus whether the bars are mirrored; Pool is frozen
+    and callers only filter the list, so sharing it is safe."""
+    key = (b.index[0].value, b.index[cut - 1].value if cut > 0 else None, bool(b["close"].iat[0] < 0))
+    if key not in _POOL_CACHE:
+        if len(_POOL_CACHE) > 20000:
+            _POOL_CACHE.clear()
+        _POOL_CACHE[key] = find_pools(b, cut)
+    return _POOL_CACHE[key]
+
+
+def _entry_filters(b: pd.DataFrame, h, l, live: int, entry: float, risk: float, p: Params,
+                   st: np.ndarray | None) -> str | None:
+    """The live skip rules, checked when the order would be placed (bar `live`, reading bars before it
+    only). Returns the reason for a skip, or None."""
+    if risk < p.min_stop:
+        return f"stop {risk:.2f} under {p.min_stop}"
+    if p.stop_vs_range > 0:
+        rng = float(np.median(h[max(0, live - p.range_bars):live] - l[max(0, live - p.range_bars):live]))
+        if risk < p.stop_vs_range * rng:
+            return f"stop {risk:.2f} small next to {rng:.2f}-pt bars"
+    if p.structure_agree and (st is None or st[live - 1] != -1):
+        return "against structure"
+    if np.isfinite(p.max_opposing_gap):
+        two_r = entry - 2 * risk
+        for f in find_fvgs(b.iloc[:live], live, p.min_gap, 10 ** 6):
+            if (f.side == "bull" and f.state == "open" and f.high - f.low >= p.max_opposing_gap
+                    and f.low < entry and f.high > two_r):
+                return f"open {f.high - f.low:.2f}-pt opposing gap before 2R"
+    return None
+
+
 def _exit(h, l, c, fill: int, end: int, entry: float, stop: float, legs: list, be_at: float | None,
           trail: int = 0, slip: float = 0.0):
     """R for a short. legs = [(fraction, target price or None)]; be_at = price that arms a stop at
@@ -196,13 +256,15 @@ def _exit(h, l, c, fill: int, end: int, entry: float, stop: float, legs: list, b
     return r, last
 
 
-def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str) -> tuple[list[Trade], dict]:
-    """Short-side logic on (possibly mirrored) bars b."""
+def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str,
+             st: np.ndarray | None = None) -> tuple[list[Trade], dict]:
+    """Short-side logic on (possibly mirrored) bars b. `st` = `structure(b)`, needed only when
+    `p.structure_agree` (on mirrored bars it is already sign-flipped, so -1 always means "with the trade")."""
     o, h, l, c = (b[k].to_numpy() for k in ("open", "high", "low", "close"))
     log = {"session": s, "date": str(b.index[ws].date()), "side": side, "sweeps": 0, "shifts": 0,
            "orders": 0, "passed": []}
     trades: list[Trade] = []
-    pools0 = find_pools(b, ws)
+    pools0 = _pools(b, ws)
     kinds = (lambda pl: pl.significant) if p.sweep_kinds == "significant" else (lambda pl: True)
     bsl = [pl for pl in pools0 if pl.side == "BSL" and pl.swept is None and kinds(pl)]
     i = ws
@@ -241,22 +303,31 @@ def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str) ->
             log["passed"].append(f"stop {risk:.2f} over {p.max_stop}")
             i = live
             continue
-        pools = find_pools(b, live)
+        skip = _entry_filters(b, h, l, live, entry, risk, p, st)
+        if skip:
+            log["passed"].append(skip)
+            i = live
+            continue
+        pools = _pools(b, live)
         tg = _targets(pools, entry, risk)
         if tg is None:
             log["passed"].append("no significant pool >= 2R")
             i = live
             continue
         log["orders"] += 1
-        fill = None
+        fill, two_r, why = None, entry - 2 * risk, "not filled"
         for j in range(live, we):
-            if c[j - 1] > g.high and j - 1 >= live:  # invalidated before the fill
+            if c[j - 1] > g.high and j - 1 >= live:
+                why = "invalidated before the fill"
                 break
-            if h[j] >= entry:
+            if h[j] >= entry:  # a fill wins a tie with 2R: the fill bar cannot take profit anyway
                 fill = j
                 break
+            if p.cancel_tp1_unfilled and l[j] <= two_r:
+                why = "2R before fill"  # the move happened without us: cancel
+                break
         if fill is None:
-            log["passed"].append("not filled / invalidated")
+            log["passed"].append(why)
             i = live
             continue
         ext_p = tg["ext"][0]
@@ -303,6 +374,10 @@ def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str) ->
 
 def run(b: pd.DataFrame, p: Params = Params()) -> tuple[list[Trade], list[dict]]:
     mb = _mirror(b)
+    # Structure once over the whole series (state at j reads bars <= j only); on mirrored bars it
+    # comes out sign-flipped, which is what the short-side code expects.
+    st_b = structure(b) if p.structure_agree else None
+    st_m = structure(mb) if p.structure_agree else None
     trades, logs = [], []
     for s, ws, we in _windows(b, p):
         lo = max(0, int(np.searchsorted(b.index, b.index[ws] - pd.Timedelta(days=16))))
@@ -317,8 +392,9 @@ def run(b: pd.DataFrame, p: Params = Params()) -> tuple[list[Trade], list[dict]]
             sides = ["short" if d < 0 else "long"]
         found = []
         for side in sides:
-            src = b if side == "short" else mb
-            t, log = _session(src.iloc[lo:we], s, ws - lo, we - lo, p, side)
+            src, st = (b, st_b) if side == "short" else (mb, st_m)
+            t, log = _session(src.iloc[lo:we], s, ws - lo, we - lo, p, side,
+                              None if st is None else st[lo:we])
             if side == "long":
                 for x in t:  # back to real prices
                     x.entry, x.stop = -x.entry, -x.stop
@@ -371,3 +447,58 @@ def _streak(r: np.ndarray) -> int:
 
 def load(interval: str = "1m") -> pd.DataFrame:
     return read_csv(cache_path("NQ=F", interval))
+
+
+def bootstrap_ci(trades: list[Trade], model: str = LIVE_MODEL, boot: int = 5000, seed: int = 11,
+                 by_session: bool = False) -> list[float] | None:
+    """95% CI on mean R. `by_session` resamples whole trading sessions (a block bootstrap), because
+    two trades in one session share the same tape and are not independent."""
+    if len(trades) < 2:
+        return None
+    rng = np.random.default_rng(seed)
+    if not by_session:
+        r = np.array([t.r[model] for t in trades])
+        means = rng.choice(r, size=(boot, r.size), replace=True).mean(axis=1)
+    else:
+        keys = sorted({(t.date, t.session) for t in trades})
+        blocks = [np.array([t.r[model] for t in trades if (t.date, t.session) == k]) for k in keys]
+        sums = np.array([x.sum() for x in blocks])
+        counts = np.array([x.size for x in blocks])
+        pick = rng.integers(0, len(blocks), size=(boot, len(blocks)))
+        means = sums[pick].sum(axis=1) / counts[pick].sum(axis=1)
+    return [round(float(np.percentile(means, 2.5)), 3), round(float(np.percentile(means, 97.5)), 3)]
+
+
+def _row(name: str, trades: list[Trade], logs: list[dict]) -> dict:
+    r = np.array([t.r[LIVE_MODEL] for t in trades])
+    passed: dict[str, int] = {}
+    for lg in logs:
+        for why in lg.get("passed", []):
+            key = why
+            key = "stop over max" if "over" in why and why.startswith("stop") else key
+            key = "stop under min" if "under" in why and why.startswith("stop") else key
+            key = "stop small next to bars" if "small next to" in why else key
+            key = "opposing gap before 2R" if "opposing gap" in why else key
+            passed[key] = passed.get(key, 0) + 1
+    return {"name": name, "trades": int(r.size),
+            "total_r": round(float(r.sum()), 2) if r.size else 0.0,
+            "mean_r": round(float(r.mean()), 3) if r.size else None,
+            "win_rate": round(float((r > 0.05).mean()), 3) if r.size else None,
+            "worst_streak": _streak(r) if r.size else 0,
+            "ci95_trades": bootstrap_ci(trades), "ci95_sessions": bootstrap_ci(trades, by_session=True),
+            "skipped": dict(sorted(passed.items(), key=lambda kv: -kv[1]))}
+
+
+def ablation(b: pd.DataFrame) -> dict:
+    """Baseline vs the live rule set, then the live set with one filter turned off at a time, all on
+    the `p2r_trail` exit. Shows what each live rule actually does to the sample."""
+    base, live = Params(htf="both"), Params.live()
+    rows = []
+    for name, p in [("baseline (no filters)", base), ("live (all filters)", live)] + [
+            (f"live without {f}", replace(live, **{f: getattr(base, f)})) for f in LIVE_FILTERS]:
+        t, lg = run(b, p)
+        rows.append(_row(name, t, lg))
+    t, _ = run(b, live)
+    return {"model": LIVE_MODEL, "bars": len(b), "from": str(b.index[0]), "to": str(b.index[-1]),
+            "rows": rows, "live_by_model": summary(t),
+            "live_trades": [{k: v for k, v in asdict(x).items() if k != "targets"} for x in t]}

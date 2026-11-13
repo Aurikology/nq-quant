@@ -5,6 +5,7 @@
   sweep      parameter grid, chosen in-sample, reported out-of-sample; writes sweep-latest.json
   scan       the automated box for the next session, validated by core/plan.js; files nothing
   levels     FVGs, IFVGs, liquidity pools, the DOL and its LRLR/HRLR grade at the latest closed bar
+  judas      Judas-swing replay: baseline vs the live rule set, one filter ablated at a time; writes judas-latest.json
 """
 
 from __future__ import annotations
@@ -55,6 +56,33 @@ def _exec(a, m: Market) -> Market | None:
         sys.exit(f"no 1m bars at {path}; run `python -m quant fetch --interval 1m` or pass --exec same")
     em = Market(read_csv(path))
     return None if em.bar_secs >= m.bar_secs else em
+
+
+def cmd_judas(a):
+    import time
+    from . import judas
+    path = Path(a.csv) if a.csv else cache_path("NQ=F", "1m")
+    if not path.exists():
+        sys.exit(f"no bars at {path}; run `python -m quant fetch --interval 1m` or pass --csv")
+    b = read_csv(path)
+    if a.days:
+        b = b[b.index >= b.index[-1] - timedelta(days=a.days)]
+    t0 = time.perf_counter()
+    rep = judas.ablation(b)
+    rep["seconds"] = round(time.perf_counter() - t0, 1)
+    rep["ranAt"] = datetime.now(ZoneInfo("America/Toronto")).isoformat(timespec="seconds")
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "judas-latest.json").write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
+    print(f"{rep['bars']:,} bars {rep['from'][:10]} to {rep['to'][:10]}, exit model {rep['model']}, "
+          f"{len(rep['rows'])} runs in {rep['seconds']} s")
+    print(f"{'run':34} {'n':>3} {'totR':>7} {'meanR':>7} {'win':>5}  95% CI (trades)   95% CI (sessions)")
+    for r in rep["rows"]:
+        ci = lambda c: f"[{c[0]:+.2f}, {c[1]:+.2f}]" if c else "   n/a"
+        mean = f"{r['mean_r']:+.3f}" if r["mean_r"] is not None else "   n/a"
+        win = f"{r['win_rate']:.2f}" if r["win_rate"] is not None else "  n/a"
+        print(f"{r['name']:34} {r['trades']:>3} {r['total_r']:>+7.2f} {mean:>7} {win:>5}  "
+              f"{ci(r['ci95_trades']):17} {ci(r['ci95_sessions'])}")
+    print(f"wrote {OUT / 'judas-latest.json'}")
 
 
 def cmd_fetch(a):
@@ -301,9 +329,13 @@ def main(argv=None):
     lv.add_argument("--near", type=int, default=6, help="how many FVGs and IFVGs to list")
     lv.add_argument("--json", action="store_true", help="machine-readable output to stdout")
 
+    jd = sub.add_parser("judas")
+    jd.add_argument("--csv", help="1m bars CSV; default the Yahoo 1m cache")
+    jd.add_argument("--days", type=int, help="only the last N calendar days")
+
     a = ap.parse_args(argv)
     {"fetch": cmd_fetch, "backtest": cmd_backtest, "sweep": cmd_sweep, "scan": cmd_scan,
-     "levels": cmd_levels}[a.cmd](a)
+     "levels": cmd_levels, "judas": cmd_judas}[a.cmd](a)
 
 
 if __name__ == "__main__":
