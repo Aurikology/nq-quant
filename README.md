@@ -16,6 +16,7 @@ The pattern is a mechanical rule set for "inverted fair value gaps": three-bar p
 | Statistics | `quant/metrics.py` | Net P&L, profit factor, daily Sharpe, max drawdown, a **bootstrap 95% CI** on mean R, and a **permutation test** against random entries |
 | Model selection | `python -m quant sweep` | Grid search, with parameters chosen **in-sample** and reported **out-of-sample** (70/30 split by date) |
 | Live-rule ablation | `python -m quant judas` | Replays a discretionary trader's written entry rules as five switchable filters, then turns each off in turn to measure what it does. CIs by trade and by **session block bootstrap** (trades in one session share a tape) |
+| Discretionary benchmark | `python -m quant journal` | Scores a trader's 312 hand-replayed trades (FX Replay export) with the same bootstrap and session-block CIs. Sessions are recovered from interleaved rows by **balance-chain linking**, since the export has no session column |
 | Performance | `quant/liquidity.py` `RangeMax` | Equal-high/low clustering asks "did any bar between two pivots trade past this level?" thousands of times per call. A **sparse table** answers it in O(1) after an O(n log n) build, and pools are memoized across runs. Tested equal to the original scan on randomized series |
 
 ## Latest result (5m structure, 1m fills, 2026-09-15 to 2026-10-13)
@@ -47,6 +48,21 @@ The Judas-swing replay (`quant/judas.py`) with the exit a trader uses live: half
 
 Speed (same machine, identical output): two weeks of 1m bars went from 1.6 s to 0.3 s per replay with the sparse table, and the seven-run ablation from 25.3 s to 7.2 s with pool memoization. The full two-month ablation runs in about 2 minutes.
 
+## Discretionary benchmark: 312 hand-replayed trades (NQ, 2019 to 2026)
+
+The same strategy traded by hand on bar replay (FX Replay, `CME_MINI:NQ1`), 14 sessions covering stretches of 2019 to 2026. One session was dropped before scoring because it practised a different strategy (top/bottom-tick entries); none was dropped for its results. Only these summary statistics are published, not the trade rows.
+
+| Metric | Value |
+|---|---|
+| Trades / sessions | 312 / 14 |
+| Wins / losses / breakevens | 106 / 27 / 179 |
+| Win rate, all trades | 34.0% (79.7% if breakevens are left out, as the replay tool reports it) |
+| Mean R per trade | **+0.42**, 95% CI **[+0.32, +0.53]** by trade, **[+0.35, +0.58]** by session block |
+| Mean R without the 3 largest winners | +0.39 |
+| Worst losing streak | 2 |
+
+**Reading it honestly:** unlike the coded rules, the hand-traded version has a confidence interval clear of zero, and it does not rest on a few outliers. Two caveats keep this a benchmark, not proof: bar replay is still traded by a person who may remember how a period went, and the trader chose which stretches to replay. More than half the trades are breakevens, so most of the edge is in cutting risk early, not in the hit rate. The gap between +0.42R by hand and no edge in code is the measurable target for the next rules to encode (higher-timeframe gaps, target quality).
+
 ## Run it
 
 ```bash
@@ -55,7 +71,8 @@ python -m quant fetch --interval 5m      # and --interval 1m for fills
 python -m quant backtest                 # writes data/backtests/latest.json
 python -m quant sweep                    # in-sample pick, out-of-sample report
 python -m quant judas                    # live-rule ablation on 1m bars; writes judas-latest.json
-python -m pytest quant/tests             # 100 tests; the parity tests need Node 24+
+python -m quant journal --csv <export> --exclude-final <balance>   # score hand-replayed trades
+python -m pytest quant/tests             # 104 tests; the parity tests need Node 24+
 ```
 
 Pulled out of a larger private trading-journal project, where the same rule files drive a desktop app.
