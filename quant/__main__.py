@@ -5,6 +5,7 @@
   sweep      parameter grid, chosen in-sample, reported out-of-sample; writes sweep-latest.json
   scan       the automated box for the next session, validated by core/plan.js; files nothing
   levels     FVGs, IFVGs, liquidity pools, the DOL and its LRLR/HRLR grade at the latest closed bar
+  metalabel  walk-forward meta-labeling of the replay's setups (purged, embargoed); writes metalabel-latest.json
   journal    score an FX Replay trade export with the same statistics; writes journal-latest.json
   judas      Judas-swing replay: baseline vs the live rule set, one filter ablated at a time; writes judas-latest.json
 """
@@ -59,6 +60,19 @@ def _exec(a, m: Market) -> Market | None:
     return None if em.bar_secs >= m.bar_secs else em
 
 
+def cmd_metalabel(a):
+    from . import metalabel
+    rep = metalabel.from_report(Path(a.report))
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "metalabel-latest.json").write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
+    print(f"{rep['setups']} setups, {rep['tested']} tested out of sample; all tested: {rep['oos_all']}")
+    for name, m in rep["models"].items():
+        print(f"
+{name}: taken {m['oos_taken']}")
+        for f in m["folds"]:
+            print(f"  {f}")
+
+
 def cmd_journal(a):
     from . import journal
     path = Path(a.csv)
@@ -81,11 +95,9 @@ def cmd_judas(a):
     path = Path(a.csv) if a.csv else cache_path("NQ=F", "1m")
     if not path.exists():
         sys.exit(f"no bars at {path}; run `python -m quant fetch --interval 1m` or pass --csv")
-    b = read_csv(path)
-    if a.days:
-        b = b[b.index >= b.index[-1] - timedelta(days=a.days)]
     t0 = time.perf_counter()
-    rep = judas.ablation(b)
+    rep = judas.ablation(path=str(path), days=a.days, workers=a.workers)
+    rep["workers"] = a.workers
     rep["seconds"] = round(time.perf_counter() - t0, 1)
     rep["ranAt"] = datetime.now(ZoneInfo("America/Toronto")).isoformat(timespec="seconds")
     OUT.mkdir(parents=True, exist_ok=True)
@@ -349,6 +361,10 @@ def main(argv=None):
     jd = sub.add_parser("judas")
     jd.add_argument("--csv", help="1m bars CSV; default the Yahoo 1m cache")
     jd.add_argument("--days", type=int, help="only the last N calendar days")
+    jd.add_argument("--workers", type=int, default=1, help="run the ablation configurations in parallel")
+
+    ml = sub.add_parser("metalabel")
+    ml.add_argument("--report", default=str(OUT / "judas-latest.json"), help="a judas report with baseline_trades")
 
     jn = sub.add_parser("journal")
     jn.add_argument("--csv", default=str(DATA / "fxreplay" / "trades.csv"), help="FX Replay analytics export")
@@ -357,7 +373,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     {"fetch": cmd_fetch, "backtest": cmd_backtest, "sweep": cmd_sweep, "scan": cmd_scan,
-     "levels": cmd_levels, "judas": cmd_judas, "journal": cmd_journal}[a.cmd](a)
+     "levels": cmd_levels, "judas": cmd_judas, "journal": cmd_journal, "metalabel": cmd_metalabel}[a.cmd](a)
 
 
 if __name__ == "__main__":

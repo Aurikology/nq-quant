@@ -19,7 +19,9 @@ The pattern is a mechanical rule set for "inverted fair value gaps": three-bar p
 | Model selection | `python -m quant sweep` | Grid search, with parameters chosen **in-sample** and reported **out-of-sample** (70/30 split by date) |
 | Live-rule ablation | `python -m quant judas` | Replays a discretionary trader's written entry rules as five switchable filters, then turns each off in turn to measure what it does. CIs by trade and by **session block bootstrap** (trades in one session share a tape) |
 | Discretionary benchmark | `python -m quant journal` | Scores a trader's 312 hand-replayed trades (FX Replay export) with the same bootstrap and session-block CIs. Sessions are recovered from interleaved rows by **balance-chain linking**, since the export has no session column |
-| Performance | `quant/liquidity.py` `RangeMax` | Equal-high/low clustering asks "did any bar between two pivots trade past this level?" thousands of times per call. A **sparse table** answers it in O(1) after an O(n log n) build, and pools are memoized across runs. Tested equal to the original scan on randomized series |
+| Performance | `quant/liquidity.py` `RangeMax`, `PoolIndex` | Built for 3.4M-bar series. A **sparse table** answers range-max queries in O(1) and "first bar after i that trades past x" in O(log n) by descending its power-of-two blocks. `PoolIndex` clusters every pivot **once** in a streaming pass instead of re-clustering at every candidate, and FVG states come from the same O(log n) lookups instead of per-gap scans. Each piece is tested **exactly equal** to the code it replaced on randomized series. Ablation configurations run in a process pool (`--workers`) |
+| Multiple testing | `quant/stats.py` | Probabilistic and **deflated Sharpe ratio** (Bailey and Lopez de Prado): the chance the best of N variants beats what luck alone gives, adjusted for skew and fat tails. The expected-maximum term matches a 20,000-run simulation within 3% |
+| Meta-labeling | `quant/metalabel.py` | A second model (logistic regression, gradient-boosted trees) decides whether to take each mechanical setup from features known at the order. **Walk-forward by year with purging and an embargo**; the lift over taking every setup gets a session-block bootstrap CI and the result is deflated for every variant tried |
 
 ## Latest result (5m structure, 1m fills, 2026-09-15 to 2026-10-13)
 
@@ -51,7 +53,7 @@ The Judas-swing replay (`quant/judas.py`) with the exit a trader uses live: half
 
 **Reading it honestly:** written down as code, the live rules remove 92% of setups, and no version shows an edge. The cancel-before-fill rule is the only one that changes this sample; the other four overlap. The trader's discretionary paper results come from judgement this code does not capture, such as higher-timeframe gaps and target quality, and this table measures that gap rather than assuming it away. The two rules most often credited for the hand-traded results (enter inside a higher-timeframe gap; only target liquidity with no open opposing gap in the way) were coded and tested too. Neither recovers an edge on this sample; each cuts the setups to a handful. The target is a sample of **200+ trades** from multi-year exported 1m data (`--csv`) before any of these numbers mean much.
 
-Speed (same machine, identical output): two weeks of 1m bars went from 1.6 s to 0.3 s per replay with the sparse table, and the seven-run ablation from 25.3 s to 7.2 s with pool memoization. The full two-month ablation runs in about 2 minutes.
+Speed (same machine, identical trades): two weeks of 1m bars went from 1.6 s to 0.3 s per replay with the sparse table. On two months of the 7-year data (73,560 bars) a replay went from 293.6 s to 80.3 s with the streaming pool index and to 29.0 s with O(log n) FVG tracking, **10x overall**, same 44 trades.
 
 ## Discretionary benchmark: 312 hand-replayed trades (NQ, 2019 to 2026)
 
@@ -76,8 +78,10 @@ python -m quant fetch --interval 5m      # and --interval 1m for fills
 python -m quant backtest                 # writes data/backtests/latest.json
 python -m quant sweep                    # in-sample pick, out-of-sample report
 python -m quant judas                    # live-rule ablation on 1m bars; writes judas-latest.json
+python -m quant judas --csv <1m csv> --workers 2   # any 1m OHLC CSV, e.g. Dukascopy (epoch-ms timestamps)
+python -m quant metalabel                # walk-forward meta-labeling of the judas report's setups
 python -m quant journal --csv <export> --exclude-final <balance>   # score hand-replayed trades
-python -m pytest quant/tests             # 109 tests; the parity tests need Node 24+
+python -m pytest quant/tests             # 167 tests; the parity tests need Node 24+
 ```
 
 Pulled out of a larger private trading-journal project, where the same rule files drive a desktop app.

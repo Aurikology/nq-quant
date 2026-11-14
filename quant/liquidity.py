@@ -135,31 +135,52 @@ class FVG:
 
 
 def find_fvgs(bars: pd.DataFrame, cut: int, min_gap: float = 1.0, max_age: int = 96) -> list[FVG]:
-    """Every FVG formed before `cut`, with its state as of the close of bar cut-1."""
+    """Every FVG formed before `cut`, with its state as of the close of bar cut-1.
+
+    Each state change is "the first later bar where a series crosses a level". Instead of scanning
+    the bars after every gap (O(gaps x bars)), six range-max tables are built once and each change
+    is one `first_ge` lookup, O(log n). `_track_scan` in the tests is the original scan; they agree.
+    """
     o, h, l, c = _ohlc(bars, cut)
     out: list[FVG] = []
-    for i in np.flatnonzero(l[2:] - h[:-2] >= min_gap) + 2:  # BISI
-        out.append(_track("bull", float(h[i - 2]), float(l[i]), int(i), o, h, l, c, max_age))
-    for i in np.flatnonzero(l[:-2] - h[2:] >= min_gap) + 2:  # SIBI
-        out.append(_track("bear", float(h[i]), float(l[i - 2]), int(i), o, h, l, c, max_age))
+    bull = np.flatnonzero(l[2:] - h[:-2] >= min_gap) + 2
+    bear = np.flatnonzero(l[:-2] - h[2:] >= min_gap) + 2
+    if bull.size == 0 and bear.size == 0:
+        return out
+    t = _FvgTables(o, h, l, c)
+    for i in bull:  # BISI
+        out.append(t.track("bull", float(h[i - 2]), float(l[i]), int(i), max_age))
+    for i in bear:  # SIBI
+        out.append(t.track("bear", float(h[i]), float(l[i - 2]), int(i), max_age))
     out.sort(key=lambda g: (g.formed, g.side))
     return out
 
 
-def _track(side: str, lo: float, hi: float, i: int, o, h, l, c, max_age: int) -> FVG:
-    n, s, ce = len(c), i + 1, (lo + hi) / 2
-    end = min(n, i + 1 + max_age)
-    if side == "bull":
-        mit, ceb, thru = _first(l[s:] <= hi, s), _first(l[s:] <= ce, s), _first(l[s:] <= lo, s)
-        inv = _first((c[s:end] < lo) & (c[s:end] < o[s:end]), s)
-        kill = _first(c[inv + 1:] > hi, inv + 1) if inv is not None else None
-    else:
-        mit, ceb, thru = _first(h[s:] >= lo, s), _first(h[s:] >= ce, s), _first(h[s:] >= hi, s)
-        inv = _first((c[s:end] > hi) & (c[s:end] > o[s:end]), s)
-        kill = _first(c[inv + 1:] < lo, inv + 1) if inv is not None else None
-    state = ("inverted" if inv is not None else "filled" if thru is not None else
-             "ce" if ceb is not None else "mitigated" if mit is not None else "open")
-    return FVG(side, lo, hi, i, state, mit, ceb, thru, inv, kill)
+class _FvgTables:
+    """Range-max tables over the series each FVG state is read from (lows and bodies mirrored)."""
+
+    def __init__(self, o, h, l, c):
+        self.h, self.neg_l = RangeMax(h), RangeMax(-l)
+        self.c, self.neg_c = RangeMax(c), RangeMax(-c)
+        ninf = np.full(len(c), -np.inf)
+        self.bear_body = RangeMax(np.where(c < o, -c, ninf))  # down-close bars, by -close
+        self.bull_body = RangeMax(np.where(c > o, c, ninf))  # up-close bars, by close
+
+    def track(self, side: str, lo: float, hi: float, i: int, max_age: int) -> FVG:
+        s, ce, end = i + 1, (lo + hi) / 2, i + 1 + max_age
+        if side == "bull":  # wicks trade down into it; a down-close below lo inverts it
+            mit, ceb, thru = (self.neg_l.first_ge(s, -x) for x in (hi, ce, lo))
+            inv = self.bear_body.first_above(s, -lo)
+            inv = inv if inv is not None and inv < end else None
+            kill = self.c.first_above(inv + 1, hi) if inv is not None else None
+        else:  # wicks trade up into it; an up-close above hi inverts it
+            mit, ceb, thru = (self.h.first_ge(s, x) for x in (lo, ce, hi))
+            inv = self.bull_body.first_above(s, hi)
+            inv = inv if inv is not None and inv < end else None
+            kill = self.neg_c.first_above(inv + 1, -lo) if inv is not None else None
+        state = ("inverted" if inv is not None else "filled" if thru is not None else
+                 "ce" if ceb is not None else "mitigated" if mit is not None else "open")
+        return FVG(side, lo, hi, i, state, mit, ceb, thru, inv, kill)
 
 
 # --- 2. Liquidity pools ----------------------------------------------------------------------
@@ -248,6 +269,7 @@ class RangeMax:
 
     def __init__(self, v: np.ndarray):
         v = np.asarray(v, dtype=float)
+        self.n = len(v)
         self.rows = [v]
         k = 1
         while 2 * k <= len(v):
@@ -262,6 +284,28 @@ class RangeMax:
         k = (b - a).bit_length() - 1
         row = self.rows[k]
         return float(max(row[a], row[b - (1 << k)]))
+
+    def first_above(self, start: int, x: float) -> int | None:
+        """First index >= start whose value is > x, or None, in O(log n): walk the power-of-two
+        blocks from the largest down, skipping every block whose maximum is <= x."""
+        pos = int(start)
+        if pos >= self.n:
+            return None
+        for k in range(len(self.rows) - 1, -1, -1):
+            if pos + (1 << k) <= self.n and self.rows[k][pos] <= x:
+                pos += 1 << k
+        return pos if pos < self.n else None
+
+    def first_ge(self, start: int, x: float, end: int | None = None) -> int | None:
+        """First index in [start, end) whose value is >= x, or None, in O(log n)."""
+        end = self.n if end is None else min(end, self.n)
+        pos = int(start)
+        if pos >= end:
+            return None
+        for k in range(len(self.rows) - 1, -1, -1):
+            if pos + (1 << k) <= self.n and self.rows[k][pos] < x:
+                pos += 1 << k
+        return pos if pos < end else None
 
 
 def recent_start(bars: pd.DataFrame, cut: int, lookback_sessions: int = 3) -> int:
@@ -325,6 +369,159 @@ def find_pools(bars: pd.DataFrame, cut: int, pivot_len: int = 2, eq_tol: float =
         if tday[j] >= recent_from:
             out.append(_pool("SWING_L", "SSL", l[j], int(j), h, l))
     return out
+
+
+class PoolIndex:
+    """`find_pools(bars, cut)` for every cut, from one pass over the series.
+
+    `find_pools` rebuilds everything from the bars before `cut`; called at every candidate entry on
+    millions of bars, it re-clusters the same pivots thousands of times. Here:
+    - the bars of each trading day, week and session window are grouped once;
+    - pivots are clustered in one chronological pass (`_cluster_stream`: the `_clusters` rule on all
+      pivots; a cluster's state when pivot j arrives depends only on bars before j, so the pass has
+      no lookahead), and each cluster keeps its member list, so "the clusters as of cut" is a
+      prefix of each list;
+    - "first bar after `formed` that traded beyond `price`" is `RangeMax.first_above`, O(log n).
+    `pools_at(cut)` equals `find_pools(bars, cut)` (tested) when `horizon_bars` is None. With a
+    horizon, a cluster whose last pivot is more than that many bars old stops absorbing pivots,
+    which bounds the work on multi-year series (the sliced callers already forgot pivots older
+    than their 16-day window).
+    """
+
+    def __init__(self, bars: pd.DataFrame, pivot_len: int = 2, eq_tol: float = 2.0,
+                 lookback_sessions: int = 3, horizon_bars: int | None = None):
+        self.k, self.lookback = pivot_len, lookback_sessions
+        idx = bars.index
+        self.idx = idx
+        self.h = bars["high"].to_numpy(dtype=float)
+        self.l = bars["low"].to_numpy(dtype=float)
+        n = len(bars)
+        self.rmq_h, self.rmq_l = RangeMax(self.h), RangeMax(-self.l)
+        tday = trading_day(idx)
+        self.days, self.day_of = np.unique(tday, return_inverse=True)
+        self.day_start = np.searchsorted(self.day_of, np.arange(self.days.size))
+        di = pd.DatetimeIndex(tday)
+        week = (di - pd.to_timedelta(di.weekday, unit="D")).to_numpy()
+        _, self.week_of = np.unique(week, return_inverse=True)
+        self.bar_secs = _bar_secs(idx)
+        minute = (idx.hour * 60 + idx.minute).to_numpy()
+        self.day_bars = _groups(self.day_of, self.days.size)
+        self.week_bars = _groups(self.week_of, int(self.week_of.max()) + 1 if n else 0)
+        self.sess = []  # (name, bars per day, window end per day)
+        for name, start, end in SESSIONS:
+            mask = minute >= start if name == "ASIA" else (minute >= start) & (minute < end)
+            ends = []
+            for d in self.days:
+                day0 = pd.Timestamp(d).tz_localize(idx.tz) if idx.tz is not None else pd.Timestamp(d)
+                ends.append(day0 if name == "ASIA" else day0 + pd.Timedelta(minutes=end))
+            self.sess.append((name, _groups(np.where(mask, self.day_of, -1), self.days.size), ends))
+        self.ph, self.pl = swing_pivots(bars, n, pivot_len)
+        self.clusters = {
+            "EQH": _cluster_stream(self.ph, self.h, eq_tol, horizon_bars),
+            "EQL": _cluster_stream(self.pl, -self.l, eq_tol, horizon_bars),
+        }
+        self._cache: dict[int, list[Pool]] = {}
+
+    def _pool(self, kind: str, side: str, price: float, formed: int, cut: int) -> Pool:
+        if side == "BSL":
+            j = self.rmq_h.first_above(formed + 1, price)
+        else:
+            j = self.rmq_l.first_above(formed + 1, -price)
+        return Pool(kind, side, float(price), int(formed), j if j is not None and j < cut else None)
+
+    def _add(self, out: list, sel: np.ndarray | None, hk: str, lk: str, cut: int):
+        if sel is None or sel.size == 0:
+            return
+        hi = int(sel[np.argmax(self.h[sel])])
+        lo = int(sel[np.argmin(self.l[sel])])
+        out.append(self._pool(hk, "BSL", self.h[hi], hi, cut))
+        out.append(self._pool(lk, "SSL", self.l[lo], lo, cut))
+
+    def pools_at(self, cut: int) -> list[Pool]:
+        if cut <= 0:
+            return []
+        hit = self._cache.get(cut)
+        if hit is not None:
+            return hit
+        out: list[Pool] = []
+        cur = int(self.day_of[cut - 1])
+        if cur >= 1:
+            self._add(out, self.day_bars[cur - 1], "PDH", "PDL", cut)
+        wk = int(self.week_of[cut - 1])
+        if wk >= 1:
+            self._add(out, self.week_bars[wk - 1], "PWH", "PWL", cut)
+        closed_at = self.idx[cut - 1] + pd.Timedelta(seconds=self.bar_secs)
+        first_day = max(0, cur - self.lookback + 1)
+        for d in range(first_day, cur + 1):
+            for name, per_day, ends in self.sess:
+                if ends[d] <= closed_at:
+                    sel = per_day[d]
+                    self._add(out, None if sel is None else sel[sel < cut], f"{name}_H", f"{name}_L", cut)
+        rs = int(self.day_start[first_day])  # first bar of the recency window
+        limit = cut - self.k  # pivots confirmed by the close of bar cut-1 sit before this bar
+        for key, side, piv, px, high in (("EQH", "BSL", self.ph, self.h, True),
+                                         ("EQL", "SSL", self.pl, self.l, False)):
+            members, owner = self.clusters[key]
+            a, z = np.searchsorted(piv, rs), np.searchsorted(piv, limit)
+            for cid in sorted(set(owner[a:z].tolist())):
+                m = members[cid]
+                m = m[:np.searchsorted(m, limit)]
+                if m.size >= 2:
+                    price = px[m].max() if high else px[m].min()
+                    out.append(self._pool(key, side, price, int(m[-1]), cut))
+        for kind, side, piv, px in (("SWING_H", "BSL", self.ph, self.h), ("SWING_L", "SSL", self.pl, self.l)):
+            a, z = np.searchsorted(piv, rs), np.searchsorted(piv, limit)
+            for j in piv[a:z]:
+                out.append(self._pool(kind, side, px[j], int(j), cut))
+        self._cache[cut] = out
+        return out
+
+
+def _groups(group: np.ndarray, size: int) -> list:
+    """Bar indices of each group id 0..size-1 (None when empty); ids < 0 are left out."""
+    out: list = [None] * size
+    sel = np.flatnonzero(group >= 0)
+    if sel.size:
+        g = group[sel]
+        order = np.argsort(g, kind="stable")
+        sel, g = sel[order], g[order]
+        cuts = np.flatnonzero(np.diff(g)) + 1
+        for chunk in np.split(sel, cuts):
+            out[int(group[chunk[0]])] = chunk
+    return out
+
+
+def _cluster_stream(piv: np.ndarray, v: np.ndarray, eq_tol: float, horizon: int | None):
+    """The `_clusters` rule over every pivot once (v is mirrored for lows). Returns each cluster's
+    members (int arrays, chronological) and the cluster id of every pivot."""
+    rmq = RangeMax(v)
+    members: list[list[int]] = []
+    owner = np.empty(len(piv), dtype=int)
+    alive: list[list] = []  # [cluster id, last pivot, level, floor]
+    for n, j in enumerate(piv):
+        j = int(j)
+        p, best, still = v[j], None, []
+        for entry in alive:
+            if horizon is not None and j - entry[1] > horizon:
+                continue  # stops absorbing; its members stay as they are
+            peak = rmq.query(entry[1] + 1, j)
+            hi = max(entry[2], p)
+            fits = hi - min(entry[3], p) <= eq_tol and peak <= hi
+            if peak > entry[2] and not fits:
+                continue
+            still.append(entry)
+            if fits:
+                best = entry
+        alive = still
+        if best is not None:
+            members[best[0]].append(j)
+            best[1], best[2], best[3] = j, max(best[2], p), min(best[3], p)
+            owner[n] = best[0]
+        else:
+            members.append([j])
+            alive.append([len(members) - 1, j, p, p])
+            owner[n] = len(members) - 1
+    return [np.array(m, dtype=int) for m in members], owner
 
 
 # --- 3. DOL ----------------------------------------------------------------------------------
