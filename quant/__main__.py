@@ -5,6 +5,8 @@
   sweep      parameter grid, chosen in-sample, reported out-of-sample; writes sweep-latest.json
   scan       the automated box for the next session, validated by core/plan.js; files nothing
   levels     FVGs, IFVGs, liquidity pools, the DOL and its LRLR/HRLR grade at the latest closed bar
+  bench      old vs new algorithm timings on the same bars (asserts equal output first)
+  coverage   recall/precision of the detector against a trader's hand-replayed trades
   metalabel  walk-forward meta-labeling of the replay's setups (purged, embargoed); writes metalabel-latest.json
   journal    score an FX Replay trade export with the same statistics; writes journal-latest.json
   judas      Judas-swing replay: baseline vs the live rule set, one filter ablated at a time; writes judas-latest.json
@@ -58,6 +60,31 @@ def _exec(a, m: Market) -> Market | None:
         sys.exit(f"no 1m bars at {path}; run `python -m quant fetch --interval 1m` or pass --exec same")
     em = Market(read_csv(path))
     return None if em.bar_secs >= m.bar_secs else em
+
+
+def cmd_bench(a):
+    from . import bench
+    path = Path(a.csv) if a.csv else cache_path("NQ=F", "1m")
+    b = read_csv(path).iloc[-a.bars:]
+    for r in bench.run(b):
+        print(f"{r['what']:62} old {r['old_s']:>8} s  new {r['new_s']:>7} s  {r['speedup']:>6}x")
+
+
+def cmd_coverage(a):
+    import pandas as pd
+    from . import coverage, journal
+    d = journal.load_fxreplay(Path(a.csv))
+    s = journal.sessions(d)
+    drop = s.index[s["final_balance"].isin([round(x, 2) for x in a.exclude_final])]
+    d = d[~d["session"].isin(drop)]
+    trades = json.loads(Path(a.report).read_text(encoding="utf-8"))["baseline_trades"]
+    rep = coverage.coverage(coverage.hand_frame(d), coverage.setup_frame(trades),
+                            data_from=pd.Timestamp(a.data_from, tz=coverage.TZ))
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "coverage-latest.json").write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
+    print(f"{rep['hand_trades']} hand trades, {rep['setups_in_replayed_spans']} detector setups in the replayed spans")
+    for w in rep["by_window"]:
+        print(f"  {w}")
 
 
 def cmd_metalabel(a):
@@ -363,6 +390,16 @@ def main(argv=None):
     jd.add_argument("--days", type=int, help="only the last N calendar days")
     jd.add_argument("--workers", type=int, default=1, help="run the ablation configurations in parallel")
 
+    bn = sub.add_parser("bench")
+    bn.add_argument("--csv", help="1m bars CSV; default the Yahoo 1m cache")
+    bn.add_argument("--bars", type=int, default=20000, help="how many of the latest bars to use")
+
+    cv = sub.add_parser("coverage")
+    cv.add_argument("--report", default=str(OUT / "judas-latest.json"), help="a judas report with baseline_trades")
+    cv.add_argument("--csv", default=str(DATA / "fxreplay" / "trades.csv"), help="FX Replay analytics export")
+    cv.add_argument("--exclude-final", type=float, nargs="*", default=[], help="off-strategy sessions by final balance")
+    cv.add_argument("--data-from", default="2019-01-01", help="first date the detector has bars for")
+
     ml = sub.add_parser("metalabel")
     ml.add_argument("--report", default=str(OUT / "judas-latest.json"), help="a judas report with baseline_trades")
 
@@ -373,7 +410,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     {"fetch": cmd_fetch, "backtest": cmd_backtest, "sweep": cmd_sweep, "scan": cmd_scan,
-     "levels": cmd_levels, "judas": cmd_judas, "journal": cmd_journal, "metalabel": cmd_metalabel}[a.cmd](a)
+     "levels": cmd_levels, "judas": cmd_judas, "journal": cmd_journal, "metalabel": cmd_metalabel, "coverage": cmd_coverage, "bench": cmd_bench}[a.cmd](a)
 
 
 if __name__ == "__main__":
