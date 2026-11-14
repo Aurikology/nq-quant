@@ -1,5 +1,7 @@
 # nq-quant
 
+[![tests](https://github.com/Aurikology/nq-quant/actions/workflows/test.yml/badge.svg)](https://github.com/Aurikology/nq-quant/actions/workflows/test.yml)
+
 A backtester for Nasdaq-100 futures (NQ) on intraday bars. It tests whether a rule-based price-pattern detector beats random entries. Written in Python with NumPy and pandas, with a small JavaScript cross-check.
 
 The pattern is a mechanical rule set for "inverted fair value gaps": three-bar price imbalances that price later closes through. The interesting part is not the pattern. It is the machinery that tries hard **not** to fool itself about whether the pattern works.
@@ -43,8 +45,11 @@ The Judas-swing replay (`quant/judas.py`) with the exit a trader uses live: half
 | All live filters | 3 | −3.12 | −1.04 | too few trades |
 | Live, without cancel-before-fill | 11 | −2.25 | −0.20 | [−1.04, +0.68] |
 | Live, without any one of the other four | 3 | −3.12 | −1.04 | unchanged |
+| No filters + entry inside a 5m gap | 3 | −3.29 | −1.10 | too few trades |
+| No filters + entry inside a 15m gap | 8 | −3.25 | −0.41 | [−1.08, +0.61] |
+| No filters + low-resistance target | 7 | −4.04 | −0.58 | [−1.08, +0.65] |
 
-**Reading it honestly:** written down as code, the live rules remove 92% of setups, and no version shows an edge. The cancel-before-fill rule is the only one that changes this sample; the other four overlap. The trader's discretionary paper results come from judgement this code does not capture, such as higher-timeframe gaps and target quality, and this table measures that gap rather than assuming it away. The target is a sample of **200+ trades** from multi-year exported 1m data (`--csv`) before any of these numbers mean much.
+**Reading it honestly:** written down as code, the live rules remove 92% of setups, and no version shows an edge. The cancel-before-fill rule is the only one that changes this sample; the other four overlap. The trader's discretionary paper results come from judgement this code does not capture, such as higher-timeframe gaps and target quality, and this table measures that gap rather than assuming it away. The two rules most often credited for the hand-traded results (enter inside a higher-timeframe gap; only target liquidity with no open opposing gap in the way) were coded and tested too. Neither recovers an edge on this sample; each cuts the setups to a handful. The target is a sample of **200+ trades** from multi-year exported 1m data (`--csv`) before any of these numbers mean much.
 
 Speed (same machine, identical output): two weeks of 1m bars went from 1.6 s to 0.3 s per replay with the sparse table, and the seven-run ablation from 25.3 s to 7.2 s with pool memoization. The full two-month ablation runs in about 2 minutes.
 
@@ -72,7 +77,7 @@ python -m quant backtest                 # writes data/backtests/latest.json
 python -m quant sweep                    # in-sample pick, out-of-sample report
 python -m quant judas                    # live-rule ablation on 1m bars; writes judas-latest.json
 python -m quant journal --csv <export> --exclude-final <balance>   # score hand-replayed trades
-python -m pytest quant/tests             # 104 tests; the parity tests need Node 24+
+python -m pytest quant/tests             # 109 tests; the parity tests need Node 24+
 ```
 
 Pulled out of a larger private trading-journal project, where the same rule files drive a desktop app.

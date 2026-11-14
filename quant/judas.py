@@ -80,6 +80,10 @@ class Params:
     structure_agree: bool = False  # the Structure state at the order must already point the trade's way
     max_opposing_gap: float = float("inf")  # skip when an open opposing gap this big sits between entry and 2R (live: 10)
     cancel_tp1_unfilled: bool = False  # cancel the order if price reaches 2R before it fills
+    # Two discretionary rules from the trader's notes (2026-11-09 to 11-11), off by default:
+    htf_gap_min: int = 0  # >0: the entry must sit inside an N-minute gap on the trade's side (a respected
+                          # FVG, or an opposing FVG that has inverted), built from completed N-minute bars only
+    lr_target: bool = False  # low-resistance target: no open opposing gap of any size between entry and the target
 
     @classmethod
     def live(cls, **kw) -> "Params":
@@ -94,6 +98,7 @@ class Params:
 
 
 LIVE_FILTERS = ("min_stop", "stop_vs_range", "structure_agree", "max_opposing_gap", "cancel_tp1_unfilled")
+DISCRETIONARY = ("htf_gap_min", "lr_target")
 LIVE_MODEL = "p2r_trail"
 
 
@@ -224,6 +229,42 @@ def _entry_filters(b: pd.DataFrame, h, l, live: int, entry: float, risk: float, 
     return None
 
 
+def htf_bars(b: pd.DataFrame, cut: int, minutes: int) -> pd.DataFrame:
+    """N-minute bars from the 1m bars before `cut`, keeping only N-minute bars that had closed by the
+    close of bar cut-1 (no partial bar, so no lookahead)."""
+    x = b.iloc[:cut]
+    if x.empty:
+        return x
+    r = x.resample(f"{minutes}min", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    done = x.index[-1] + pd.Timedelta(minutes=1)
+    return r[r.index + pd.Timedelta(minutes=minutes) <= done]
+
+
+def in_htf_gap(b: pd.DataFrame, cut: int, entry: float, minutes: int, min_gap: float = 1.0) -> bool:
+    """Short side: is `entry` inside a bearish N-minute FVG that still holds (not filled, not
+    inverted), or inside a bullish one that has inverted and not been invalidated?"""
+    hb = htf_bars(b, cut, minutes)
+    for g in find_fvgs(hb, len(hb), min_gap):
+        if not g.low <= entry <= g.high:
+            continue
+        if g.side == "bear" and g.state in ("open", "mitigated", "ce"):
+            return True
+        if g.side == "bull" and g.live_ifvg:
+            return True
+    return False
+
+
+def _discretionary(b: pd.DataFrame, live: int, entry: float, target: float, p: Params) -> str | None:
+    if p.htf_gap_min and not in_htf_gap(b, live, entry, p.htf_gap_min, p.min_gap):
+        return f"entry not in a {p.htf_gap_min}m gap"
+    if p.lr_target:
+        for f in find_fvgs(b.iloc[:live], live, p.min_gap, 10 ** 6):
+            if f.side == "bull" and f.state in ("open", "mitigated", "ce") and f.low < entry and f.high > target:
+                return "high-resistance target"
+    return None
+
+
 def _exit(h, l, c, fill: int, end: int, entry: float, stop: float, legs: list, be_at: float | None,
           trail: int = 0, slip: float = 0.0):
     """R for a short. legs = [(fraction, target price or None)]; be_at = price that arms a stop at
@@ -312,6 +353,11 @@ def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str,
         tg = _targets(pools, entry, risk)
         if tg is None:
             log["passed"].append("no significant pool >= 2R")
+            i = live
+            continue
+        skip = _discretionary(b, live, entry, tg["ext"][0], p)
+        if skip:
+            log["passed"].append(skip)
             i = live
             continue
         log["orders"] += 1
@@ -494,8 +540,12 @@ def ablation(b: pd.DataFrame) -> dict:
     the `p2r_trail` exit. Shows what each live rule actually does to the sample."""
     base, live = Params(htf="both"), Params.live()
     rows = []
+    extra = [("baseline + 5m gap entry", replace(base, htf_gap_min=5)),
+             ("baseline + 15m gap entry", replace(base, htf_gap_min=15)),
+             ("baseline + low-resistance target", replace(base, lr_target=True)),
+             ("baseline + 5m gap + LR target", replace(base, htf_gap_min=5, lr_target=True))]
     for name, p in [("baseline (no filters)", base), ("live (all filters)", live)] + [
-            (f"live without {f}", replace(live, **{f: getattr(base, f)})) for f in LIVE_FILTERS]:
+            (f"live without {f}", replace(live, **{f: getattr(base, f)})) for f in LIVE_FILTERS] + extra:
         t, lg = run(b, p)
         rows.append(_row(name, t, lg))
     t, _ = run(b, live)
