@@ -336,7 +336,7 @@ def find_pools(bars: pd.DataFrame, cut: int, pivot_len: int = 2, eq_tol: float =
     if days.size >= 2:
         extremes(tday == days[-2], "PDH", "PDL")
     di = pd.DatetimeIndex(tday)
-    week = (di - pd.to_timedelta(di.weekday, unit="D")).to_numpy()  # Monday of the trading week
+    week = (di - pd.to_timedelta(di.day_of_week, unit="D")).to_numpy()  # Monday of the trading week
     weeks = np.unique(week)
     if weeks.size >= 2:
         extremes(week == weeks[-2], "PWH", "PWL")
@@ -401,7 +401,7 @@ class PoolIndex:
         self.days, self.day_of = np.unique(tday, return_inverse=True)
         self.day_start = np.searchsorted(self.day_of, np.arange(self.days.size))
         di = pd.DatetimeIndex(tday)
-        week = (di - pd.to_timedelta(di.weekday, unit="D")).to_numpy()
+        week = (di - pd.to_timedelta(di.day_of_week, unit="D")).to_numpy()
         _, self.week_of = np.unique(week, return_inverse=True)
         self.bar_secs = _bar_secs(idx)
         minute = (idx.hour * 60 + idx.minute).to_numpy()
@@ -608,7 +608,7 @@ def htf_bias(bars: pd.DataFrame, cut: int) -> tuple[int, int, list[str]]:
     _, h, l, c = _ohlc(bars, cut)
     tday = trading_day(bars.index[:cut])
     di = pd.DatetimeIndex(tday)
-    week = (di - pd.to_timedelta(di.weekday, unit="D")).to_numpy()
+    week = (di - pd.to_timedelta(di.day_of_week, unit="D")).to_numpy()
     d, dwhy = _htf_bias(tday, h, l, c)
     w, wwhy = _htf_bias(week, h, l, c)
     return d, w, [f"daily {d:+d} ({dwhy})", f"weekly {w:+d} ({wwhy})"]

@@ -65,7 +65,7 @@ def build_plan(bars: pd.DataFrame, tday: np.ndarray, bar_secs: int, ifvgs: list[
                window: Window, rules: dict, params: Params, timeframe: str) -> Setup:
     # Only bars that had closed by the deadline: open time + bar length <= deadline.
     last_open = pd.Timestamp(window.plan_deadline) - pd.Timedelta(seconds=bar_secs)
-    cut = int(np.searchsorted(bars.index.asi8, last_open.value, side="right"))
+    cut = int(np.searchsorted(bars.index.as_unit("ns").asi8, last_open.value, side="right"))
     lv = levels_at(bars, tday, cut)
     if lv is None:
         return Setup(None, "no prior trading day in the data")

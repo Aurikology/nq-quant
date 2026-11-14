@@ -7,6 +7,11 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pandas: ["2.3.*", "3.*"]
+    name: pytest (pandas ${{ matrix.pandas }})
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,5 +20,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - run: pip install -r quant/requirements.txt
+      - run: pip install -r quant/requirements.txt "pandas==${{ matrix.pandas }}"
       - run: python -m pytest quant/tests -q

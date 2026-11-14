@@ -82,7 +82,7 @@ class Market:
         return self._ifvgs[min_gap]
 
     def span(self, start, end) -> tuple[int, int]:
-        idx = self.t.asi8  # UTC nanoseconds; comparing ints sidesteps tz-aware object arrays
+        idx = self.t.as_unit("ns").asi8  # UTC ns whatever the index unit (pandas 3 defaults to us)
         return (int(np.searchsorted(idx, pd.Timestamp(start).value, "left")),
                 int(np.searchsorted(idx, pd.Timestamp(end).value, "left")))
 
