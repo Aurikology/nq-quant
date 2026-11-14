@@ -78,10 +78,13 @@ def update_cache(symbol: str = "NQ=F", interval: str = "5m", root: Path = MARKET
 def read_csv(path: Path, tz: str = "America/Toronto") -> pd.DataFrame:
     """Load bars from any CSV with a time column and OHLC columns (case-insensitive).
 
-    Time may be unix seconds (TradingView's default export) or ISO strings with an offset.
+    Time may be unix seconds (TradingView's default export), ISO strings with an offset, or a
+    `timestamp` column in epoch milliseconds (Dukascopy).
     """
     raw = pd.read_csv(path)
     raw.columns = [c.strip().lower() for c in raw.columns]
+    if "time" not in raw.columns and "timestamp" in raw.columns:  # Dukascopy: epoch milliseconds
+        raw["time"] = raw["timestamp"] / 1000
     t = raw["time"]
     idx = pd.to_datetime(t, unit="s", utc=True) if pd.api.types.is_numeric_dtype(t) else pd.to_datetime(t, utc=True)
     df = raw.set_index(idx)

@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .stats import psr, sharpe
+
 BE = 0.05  # |R| at or under this is a breakeven
 
 
@@ -87,6 +89,8 @@ def score(d: pd.DataFrame, exclude_final: tuple[float, ...] = ()) -> dict:
         "mean_r_without_top3": round(float(top[3:].mean()), 3) if r.size > 3 else None,
         "mean_mfe_r": round(float(k["mfe_r"].mean()), 3),
         "worst_losing_streak": _streak(r),
+        "sharpe_per_trade": round(sharpe(r), 4),
+        "psr_vs_0": round(psr(r, 0.0), 4),  # P(true per-trade Sharpe > 0), skew/kurtosis adjusted
     }
 
 

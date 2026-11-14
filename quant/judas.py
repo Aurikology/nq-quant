@@ -43,8 +43,9 @@ import numpy as np
 import pandas as pd
 
 from .config import DATA, TICK_SIZE
-from .liquidity import find_fvgs, find_pools, htf_bias, swing_pivots
+from .liquidity import Pool, PoolIndex, find_fvgs, find_pools, htf_bias, swing_pivots
 from .market import cache_path, read_csv
+from .stats import deflated_sharpe, sharpe
 
 WINDOWS = {  # session: (start minute, end minute) ET; asia ends at midnight
     "asia": (20 * 60, 24 * 60),
@@ -192,20 +193,25 @@ def structure(b: pd.DataFrame, pivot: int = 2) -> np.ndarray:
     return state
 
 
-_POOL_CACHE: dict = {}
+_INDEX_CACHE: dict = {}
+HORIZON_DAYS = 16  # pivots older than this stop joining equal-high/low clusters (the old slice length)
 
 
-def _pools(b: pd.DataFrame, cut: int) -> list:
-    """`find_pools(b, cut)`, memoized. Pools depend only on the bars before `cut`, and every run
-    (baseline, live, each ablation) asks for the same (window, cut) pairs, so they are computed once.
-    The key is the window's first and last-read bar plus whether the bars are mirrored; Pool is frozen
-    and callers only filter the list, so sharing it is safe."""
-    key = (b.index[0].value, b.index[cut - 1].value if cut > 0 else None, bool(b["close"].iat[0] < 0))
-    if key not in _POOL_CACHE:
-        if len(_POOL_CACHE) > 20000:
-            _POOL_CACHE.clear()
-        _POOL_CACHE[key] = find_pools(b, cut)
-    return _POOL_CACHE[key]
+def pool_index(b: pd.DataFrame) -> PoolIndex:
+    """One PoolIndex per series (and per mirror), shared by every run in an ablation."""
+    key = (b.index[0].value, b.index[-1].value, len(b), bool(b["close"].iat[0] < 0))
+    if key not in _INDEX_CACHE:
+        if len(_INDEX_CACHE) > 8:
+            _INDEX_CACHE.clear()
+        secs = max(1, int(pd.Series(b.index[:1000]).diff().dropna().mode().iloc[0].total_seconds()))
+        _INDEX_CACHE[key] = PoolIndex(b, horizon_bars=HORIZON_DAYS * 86400 // secs)
+    return _INDEX_CACHE[key]
+
+
+def _pools(ix: PoolIndex, off: int, cut: int) -> list:
+    """Pools as of bar `off + cut` of the full series, re-indexed to the session slice."""
+    return [Pool(p.kind, p.side, p.price, p.formed - off, None if p.swept is None else p.swept - off)
+            for p in ix.pools_at(off + cut)]
 
 
 def _entry_filters(b: pd.DataFrame, h, l, live: int, entry: float, risk: float, p: Params,
@@ -298,14 +304,14 @@ def _exit(h, l, c, fill: int, end: int, entry: float, stop: float, legs: list, b
 
 
 def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str,
-             st: np.ndarray | None = None) -> tuple[list[Trade], dict]:
+             st: np.ndarray | None = None, ix: PoolIndex | None = None, off: int = 0) -> tuple[list[Trade], dict]:
     """Short-side logic on (possibly mirrored) bars b. `st` = `structure(b)`, needed only when
     `p.structure_agree` (on mirrored bars it is already sign-flipped, so -1 always means "with the trade")."""
     o, h, l, c = (b[k].to_numpy() for k in ("open", "high", "low", "close"))
     log = {"session": s, "date": str(b.index[ws].date()), "side": side, "sweeps": 0, "shifts": 0,
            "orders": 0, "passed": []}
     trades: list[Trade] = []
-    pools0 = _pools(b, ws)
+    pools0 = _pools(ix, off, ws)
     kinds = (lambda pl: pl.significant) if p.sweep_kinds == "significant" else (lambda pl: True)
     bsl = [pl for pl in pools0 if pl.side == "BSL" and pl.swept is None and kinds(pl)]
     i = ws
@@ -349,7 +355,7 @@ def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str,
             log["passed"].append(skip)
             i = live
             continue
-        pools = _pools(b, live)
+        pools = _pools(ix, off, live)
         tg = _targets(pools, entry, risk)
         if tg is None:
             log["passed"].append("no significant pool >= 2R")
@@ -424,6 +430,7 @@ def run(b: pd.DataFrame, p: Params = Params()) -> tuple[list[Trade], list[dict]]
     # comes out sign-flipped, which is what the short-side code expects.
     st_b = structure(b) if p.structure_agree else None
     st_m = structure(mb) if p.structure_agree else None
+    ix_b, ix_m = pool_index(b), pool_index(mb)
     trades, logs = [], []
     for s, ws, we in _windows(b, p):
         lo = max(0, int(np.searchsorted(b.index, b.index[ws] - pd.Timedelta(days=16))))
@@ -438,9 +445,9 @@ def run(b: pd.DataFrame, p: Params = Params()) -> tuple[list[Trade], list[dict]]
             sides = ["short" if d < 0 else "long"]
         found = []
         for side in sides:
-            src, st = (b, st_b) if side == "short" else (mb, st_m)
+            src, st, ix = (b, st_b, ix_b) if side == "short" else (mb, st_m, ix_m)
             t, log = _session(src.iloc[lo:we], s, ws - lo, we - lo, p, side,
-                              None if st is None else st[lo:we])
+                              None if st is None else st[lo:we], ix, lo)
             if side == "long":
                 for x in t:  # back to real prices
                     x.entry, x.stop = -x.entry, -x.stop
@@ -526,7 +533,7 @@ def _row(name: str, trades: list[Trade], logs: list[dict]) -> dict:
             key = "stop small next to bars" if "small next to" in why else key
             key = "opposing gap before 2R" if "opposing gap" in why else key
             passed[key] = passed.get(key, 0) + 1
-    return {"name": name, "trades": int(r.size),
+    return {"name": name, "_r": r.tolist(), "trades": int(r.size),
             "total_r": round(float(r.sum()), 2) if r.size else 0.0,
             "mean_r": round(float(r.mean()), 3) if r.size else None,
             "win_rate": round(float((r > 0.05).mean()), 3) if r.size else None,
@@ -535,20 +542,62 @@ def _row(name: str, trades: list[Trade], logs: list[dict]) -> dict:
             "skipped": dict(sorted(passed.items(), key=lambda kv: -kv[1]))}
 
 
-def ablation(b: pd.DataFrame) -> dict:
-    """Baseline vs the live rule set, then the live set with one filter turned off at a time, all on
-    the `p2r_trail` exit. Shows what each live rule actually does to the sample."""
+def ablation_configs() -> list[tuple[str, Params]]:
     base, live = Params(htf="both"), Params.live()
-    rows = []
-    extra = [("baseline + 5m gap entry", replace(base, htf_gap_min=5)),
-             ("baseline + 15m gap entry", replace(base, htf_gap_min=15)),
-             ("baseline + low-resistance target", replace(base, lr_target=True)),
-             ("baseline + 5m gap + LR target", replace(base, htf_gap_min=5, lr_target=True))]
-    for name, p in [("baseline (no filters)", base), ("live (all filters)", live)] + [
-            (f"live without {f}", replace(live, **{f: getattr(base, f)})) for f in LIVE_FILTERS] + extra:
-        t, lg = run(b, p)
-        rows.append(_row(name, t, lg))
-    t, _ = run(b, live)
-    return {"model": LIVE_MODEL, "bars": len(b), "from": str(b.index[0]), "to": str(b.index[-1]),
+    return ([("baseline (no filters)", base), ("live (all filters)", live)]
+            + [(f"live without {f}", replace(live, **{f: getattr(base, f)})) for f in LIVE_FILTERS]
+            + [("baseline + 5m gap entry", replace(base, htf_gap_min=5)),
+               ("baseline + 15m gap entry", replace(base, htf_gap_min=15)),
+               ("baseline + low-resistance target", replace(base, lr_target=True)),
+               ("baseline + 5m gap + LR target", replace(base, htf_gap_min=5, lr_target=True))])
+
+
+_WORKER_BARS: pd.DataFrame | None = None
+
+
+def _worker_init(path: str, days: int | None):
+    global _WORKER_BARS
+    _WORKER_BARS = _load_window(path, days)
+
+
+def _load_window(path: str, days: int | None) -> pd.DataFrame:
+    b = read_csv(Path(path))
+    return b[b.index >= b.index[-1] - pd.Timedelta(days=days)] if days else b
+
+
+def _one(name: str, p: Params) -> dict:
+    t, lg = run(_WORKER_BARS, p)
+    row = _row(name, t, lg)
+    row["_trades"] = t  # every exit model's R per trade; dropped from the report below
+    return row
+
+
+def ablation(b: pd.DataFrame | None = None, path: str | None = None, days: int | None = None,
+             workers: int = 1) -> dict:
+    """Baseline vs the live rule set, the live set with one filter turned off at a time, and the two
+    discretionary rules, all on the `p2r_trail` exit. With `workers` > 1 the runs are independent
+    and go to a process pool; each worker loads the bars once (from `path`)."""
+    global _WORKER_BARS
+    cfgs = ablation_configs()
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(workers, initializer=_worker_init, initargs=(path, days)) as ex:
+            rows = list(ex.map(_one, [n for n, _ in cfgs], [p for _, p in cfgs]))
+        b = _load_window(path, days)
+    else:
+        if b is None:
+            b = _load_window(path, days)
+        _WORKER_BARS = b
+        rows = [_one(n, p) for n, p in cfgs]
+    live = Params.live()
+    rs = {row["name"]: np.array(row.pop("_r")) for row in rows}
+    srs = [sharpe(r) for r in rs.values()]
+    best = max((k for k in rs if rs[k].size >= 2), key=lambda k: sharpe(rs[k]), default=None)
+    dsr = {"best_run": best, **deflated_sharpe(rs[best], srs)} if best else None
+    by_name = {row["name"]: row.pop("_trades") for row in rows}
+    t = by_name["live (all filters)"]
+    base_t = by_name["baseline (no filters)"]
+    return {"baseline_by_model": summary(base_t),"model": LIVE_MODEL, "deflated_sharpe_of_best_run": dsr, "bars": len(b), "from": str(b.index[0]), "to": str(b.index[-1]),
             "rows": rows, "live_by_model": summary(t),
-            "live_trades": [{k: v for k, v in asdict(x).items() if k != "targets"} for x in t]}
+            "live_trades": [{k: v for k, v in asdict(x).items() if k != "targets"} for x in t],
+            "baseline_trades": [asdict(x) for x in base_t]}
