@@ -424,7 +424,32 @@ def _session(b: pd.DataFrame, s: str, ws: int, we: int, p: Params, side: str,
     return trades, log
 
 
-def run(b: pd.DataFrame, p: Params = Params()) -> tuple[list[Trade], list[dict]]:
+CHUNK_DAYS = 365  # replay longer series in windows of this many days
+WARMUP_DAYS = 21  # each window starts this early; every lookback in the replay is <= 16 days
+
+
+def run(b: pd.DataFrame, p: Params = Params(), chunk_days: int | None = CHUNK_DAYS) -> tuple[list[Trade], list[dict]]:
+    """The replay. Series longer than `chunk_days` are replayed window by window, each with
+    WARMUP_DAYS of earlier bars, keeping only sessions dated inside the window. The range tables
+    behind the pool index need O(n log n) memory, so this bounds peak memory on multi-year data;
+    the chunked and whole-series replays are tested to give the same trades."""
+    if chunk_days and len(b) and b.index[-1] - b.index[0] > pd.Timedelta(days=chunk_days):
+        trades, logs = [], []
+        start = b.index[0]
+        while start <= b.index[-1]:
+            end = start + pd.Timedelta(days=chunk_days)
+            part = b[(b.index >= start - pd.Timedelta(days=WARMUP_DAYS)) & (b.index < end)]
+            lo_d, hi_d = str(start.date()), str(end.date())
+            t, lg = _run_one(part, p)
+            trades += [x for x in t if lo_d <= x.date < hi_d]
+            logs += [x for x in lg if lo_d <= x.get("date", "") < hi_d]
+            _INDEX_CACHE.clear()
+            start = end
+        return trades, logs
+    return _run_one(b, p)
+
+
+def _run_one(b: pd.DataFrame, p: Params) -> tuple[list[Trade], list[dict]]:
     mb = _mirror(b)
     # Structure once over the whole series (state at j reads bars <= j only); on mirrored bars it
     # comes out sign-flipped, which is what the short-side code expects.
