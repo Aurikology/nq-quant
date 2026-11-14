@@ -96,7 +96,7 @@ def random_walk(days=12, seed=3):
     rng = np.random.default_rng(seed)
     idx = pd.date_range("2026-09-07 18:00", "2026-09-07 18:00", tz=ET)
     idx = pd.date_range(idx[0], periods=days * 288, freq="5min")
-    idx = idx[~((idx.dayofweek == 5) | ((idx.dayofweek == 4) & (idx.hour >= 17)) | ((idx.dayofweek == 6) & (idx.hour < 18)))]
+    idx = idx[~((idx.day_of_week == 5) | ((idx.day_of_week == 4) & (idx.hour >= 17)) | ((idx.day_of_week == 6) & (idx.hour < 18)))]
     steps = rng.standard_t(3, len(idx)) * 6
     close = 29000 + np.cumsum(steps)
     open_ = np.concatenate([[29000], close[:-1]])

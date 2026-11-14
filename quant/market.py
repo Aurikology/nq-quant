@@ -53,7 +53,7 @@ def fetch_yahoo(symbol: str = "NQ=F", interval: str = "5m") -> pd.DataFrame:
         df = _chart(YAHOO.format(symbol=symbol, interval=interval, range=MAX_RANGE[interval]))
     df = df.dropna(subset=["open", "high", "low", "close"])
     # Yahoo appends the live quote as an off-grid row (e.g. 22:34:52 on a 5m series). Not a bar.
-    df = df[df.index.asi8 % (BAR_SECONDS[interval] * 10**9) == 0]
+    df = df[df.index.as_unit("ns").asi8 % (BAR_SECONDS[interval] * 10**9) == 0]
     # The newest bar is still forming. A backtest that sees it would see the future.
     still_open = df.index + pd.Timedelta(seconds=BAR_SECONDS[interval]) > pd.Timestamp(_time.time(), unit="s", tz="UTC")
     return df[~still_open]
@@ -64,7 +64,7 @@ def update_cache(symbol: str = "NQ=F", interval: str = "5m", root: Path = MARKET
     path = cache_path(symbol, interval, root)
     fresh = fetch_yahoo(symbol, interval)
     old = read_csv(path, tz="UTC") if path.exists() else fresh.iloc[0:0]
-    old = old[old.index.asi8 % (BAR_SECONDS[interval] * 10**9) == 0]
+    old = old[old.index.as_unit("ns").asi8 % (BAR_SECONDS[interval] * 10**9) == 0]
     merged = pd.concat([old, fresh])
     merged = merged[~merged.index.duplicated(keep="last")].sort_index()
     path.parent.mkdir(parents=True, exist_ok=True)
