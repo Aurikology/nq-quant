@@ -67,8 +67,8 @@ def cmd_metalabel(a):
     (OUT / "metalabel-latest.json").write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
     print(f"{rep['setups']} setups, {rep['tested']} tested out of sample; all tested: {rep['oos_all']}")
     for name, m in rep["models"].items():
-        print(f"
-{name}: taken {m['oos_taken']}")
+        print()
+        print(f"{name}: taken {m['oos_taken']}")
         for f in m["folds"]:
             print(f"  {f}")
 
