@@ -11,7 +11,7 @@ The pattern is a mechanical rule set for "inverted fair value gaps": three-bar p
 | Stage | Module | Method |
 |---|---|---|
 | Ingest | `quant/market.py` | Pulls 1m/5m bars from Yahoo's chart endpoint or any OHLC CSV. The cache only grows, so the sample outlasts the vendor's 7- and 60-day limits |
-| Feature detection | `quant/liquidity.py`, `quant/judas.py`, `quant/signals.py` | Finds imbalances, liquidity pools and session sweeps in the series without look-ahead. A test asserts that no plan reads a bar after its deadline |
+| Feature detection | `quant/liquidity.py`, `quant/judas.py`, `quant/signals.py` | Finds imbalances, liquidity pools and session sweeps in the series without look-ahead. A test asserts that no plan reads a bar after its deadline, and **property-based tests (Hypothesis)** scramble the bars after a random cut across hundreds of generated series and require every gap, pivot, pool and structure state before it to stay identical |
 | Strategy | `quant/strategy.py` | Turns the detected structure into an entry/stop/target plan before each session opens |
 | Replay | `quant/backtest.py` | Replays bar by bar with a deliberately pessimistic fill model: the stop wins when a bar touches both levels, stops pay slippage, and the entry bar cannot take profit |
 | Risk | `quant/risk.py` | Applies daily-loss, drawdown and position-size limits. Tested for parity with an independent JavaScript implementation (`core/risk.js`) via `quant/bridge.mjs` |
@@ -81,7 +81,7 @@ python -m quant judas                    # live-rule ablation on 1m bars; writes
 python -m quant judas --csv <1m csv> --workers 2   # any 1m OHLC CSV, e.g. Dukascopy (epoch-ms timestamps)
 python -m quant metalabel                # walk-forward meta-labeling of the judas report's setups
 python -m quant journal --csv <export> --exclude-final <balance>   # score hand-replayed trades
-python -m pytest quant/tests             # 176 tests; the parity tests need Node 24+
+python -m pytest quant/tests             # 180 tests; the parity tests need Node 24+
 ```
 
 Pulled out of a larger private trading-journal project, where the same rule files drive a desktop app.
