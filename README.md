@@ -81,7 +81,9 @@ python -m quant judas                    # live-rule ablation on 1m bars; writes
 python -m quant judas --csv <1m csv> --workers 2   # any 1m OHLC CSV, e.g. Dukascopy (epoch-ms timestamps)
 python -m quant metalabel                # walk-forward meta-labeling of the judas report's setups
 python -m quant journal --csv <export> --exclude-final <balance>   # score hand-replayed trades
-python -m pytest quant/tests             # 180 tests; the parity tests need Node 24+
+python -m quant coverage --exclude-final <balance>   # how many hand trades the detector also finds
+python -m quant bench --csv <1m csv>     # old vs new algorithm timings; asserts equal output first
+python -m pytest quant/tests             # 184 tests; the parity tests need Node 24+
 ```
 
 Pulled out of a larger private trading-journal project, where the same rule files drive a desktop app.

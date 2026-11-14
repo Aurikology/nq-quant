@@ -14,7 +14,7 @@ def test_cli_module_compiles_and_shows_help():
     assert out.returncode == 0, out.stderr
 
 
-@pytest.mark.parametrize("cmd", ["fetch", "backtest", "sweep", "scan", "levels", "judas", "journal", "metalabel"])
+@pytest.mark.parametrize("cmd", ["fetch", "backtest", "sweep", "scan", "levels", "judas", "journal", "metalabel", "coverage", "bench"])
 def test_every_command_has_help(cmd):
     out = subprocess.run([sys.executable, "-m", "quant", cmd, "--help"], cwd=REPO, capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
